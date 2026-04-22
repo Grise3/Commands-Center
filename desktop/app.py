@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Commands Center - Desktop Controller
-Modern, clean interface for managing Android Commands Center
-"""
-
 import sys
 import json
 import asyncio

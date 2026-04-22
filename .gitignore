@@ -1,0 +1,7 @@
+android/.agent
+android/.gradle
+android/.idea
+android/.kotlin
+build/
+local.properties
+android/gradle

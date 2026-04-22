@@ -5,3 +5,4 @@ android/.kotlin
 build/
 local.properties
 android/gradle
+.idea/

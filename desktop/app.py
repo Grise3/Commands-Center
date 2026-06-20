@@ -132,6 +132,9 @@ class ConnectionManager(QObject):
         self._thread: Optional[threading.Thread] = None
         self._ip = ""
         self._password = ""
+        self._should_reconnect = True
+        self._reconnect_delay = 1
+        self._max_reconnect_delay = 30
 
     @property
     def state(self) -> ConnectionState:
@@ -147,14 +150,21 @@ class ConnectionManager(QObject):
 
         self._ip = ip
         self._password = password
+        self._should_reconnect = True
+        self._reconnect_delay = 1
         self._set_state(ConnectionState.CONNECTING)
 
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
     def disconnect(self):
+        self._should_reconnect = False
         if self.ws:
             asyncio.run_coroutine_threadsafe(self._close_ws(), self.loop)
+        self._set_state(ConnectionState.DISCONNECTED)
+
+    def cancel_connection(self):
+        self._should_reconnect = False
         self._set_state(ConnectionState.DISCONNECTED)
 
     def _run_loop(self):
@@ -169,26 +179,39 @@ class ConnectionManager(QObject):
             self._set_state(ConnectionState.ERROR)
 
     async def _ws_worker(self):
-        try:
-            uri = f"ws://{self._ip}:8080/ws"
-            async with websockets.connect(uri) as ws:
-                self.ws = ws
-                self._set_state(ConnectionState.AUTHENTICATING)
+        while self._should_reconnect:
+            try:
+                uri = f"ws://{self._ip}:8080/ws"
+                async with websockets.connect(uri) as ws:
+                    self.ws = ws
+                    self._set_state(ConnectionState.AUTHENTICATING)
+                    self._reconnect_delay = 1
 
-                while True:
-                    msg = await ws.recv()
-                    self._handle_message(msg)
-        except ConnectionClosedOK:
-            self._set_state(ConnectionState.DISCONNECTED)
-            self.ws = None
-        except ConnectionClosedError as e:
-            self.error_occurred.emit(f"Connection closed unexpectedly: {e}")
-            self._set_state(ConnectionState.ERROR)
-            self.ws = None
-        except Exception as e:
-            self.error_occurred.emit(str(e))
-            self._set_state(ConnectionState.ERROR)
-            self.ws = None
+                    while True:
+                        msg = await ws.recv()
+                        self._handle_message(msg)
+            except ConnectionClosedOK:
+                self._set_state(ConnectionState.DISCONNECTED)
+                self.ws = None
+                if self._should_reconnect:
+                    await self._schedule_reconnect()
+            except ConnectionClosedError as e:
+                self.error_occurred.emit(f"Connection closed unexpectedly: {e}")
+                self._set_state(ConnectionState.ERROR)
+                self.ws = None
+                if self._should_reconnect:
+                    await self._schedule_reconnect()
+            except Exception as e:
+                self.error_occurred.emit(str(e))
+                self._set_state(ConnectionState.ERROR)
+                self.ws = None
+                if self._should_reconnect:
+                    await self._schedule_reconnect()
+
+    async def _schedule_reconnect(self):
+        self._set_state(ConnectionState.CONNECTING)
+        await asyncio.sleep(self._reconnect_delay)
+        self._reconnect_delay = min(self._reconnect_delay * 2, self._max_reconnect_delay)
 
     def _handle_message(self, msg: str):
         if msg == "AUTH_REQUIRED":
@@ -619,10 +642,11 @@ class CommandsCenterWindow(QMainWindow):
             self,
             self.config.ip,
             self.config.password,
-            self.conn.state == ConnectionState.CONNECTED
+            self.conn.state
         )
         dialog.connect_clicked.connect(self._on_dialog_connect)
         dialog.disconnect_clicked.connect(self._on_dialog_disconnect)
+        dialog.cancel_clicked.connect(self._on_dialog_cancel)
         dialog.exec()
 
     def _on_dialog_connect(self, ip: str, password: str):
@@ -633,6 +657,9 @@ class CommandsCenterWindow(QMainWindow):
 
     def _on_dialog_disconnect(self):
         self.conn.disconnect()
+
+    def _on_dialog_cancel(self):
+        self.conn.cancel_connection()
 
     def _create_content(self) -> QVBoxLayout:
         layout = QVBoxLayout()
@@ -956,12 +983,13 @@ class ConnectionDialog(QDialog):
     """Dialog for connection settings"""
     connect_clicked = Signal(str, str)
     disconnect_clicked = Signal()
+    cancel_clicked = Signal()
 
-    def __init__(self, parent=None, ip="", password="", is_connected=False):
+    def __init__(self, parent=None, ip="", password="", state=ConnectionState.DISCONNECTED):
         super().__init__(parent)
         self.setWindowTitle("Connection Settings")
         self.resize(400, 300)
-        self._is_connected = is_connected
+        self._state = state
         self._setup_ui(ip, password)
         self.setStyleSheet(f"""
             QDialog {{
@@ -1000,18 +1028,24 @@ class ConnectionDialog(QDialog):
         pass_layout.addWidget(self.pass_input)
         layout.addLayout(pass_layout)
 
-        self.status_label = QLabel("● Connected" if self._is_connected else "● Disconnected")
-        self.status_label.setStyleSheet(f"color: {'#00FF44' if self._is_connected else COLORS['text_muted']}; font-weight: bold;")
+        is_connected = self._state == ConnectionState.CONNECTED
+        self.status_label = QLabel("● Connected" if is_connected else "● Disconnected")
+        self.status_label.setStyleSheet(f"color: {'#00FF44' if is_connected else COLORS['text_muted']}; font-weight: bold;")
         layout.addWidget(self.status_label)
 
         layout.addStretch()
 
         btn_layout = QHBoxLayout()
 
-        if self._is_connected:
+        if is_connected:
             self.action_btn = ActionButton("Disconnect")
             self.action_btn.setFixedHeight(40)
             self.action_btn.clicked.connect(self._on_disconnect)
+        elif self._state == ConnectionState.CONNECTING:
+            self.action_btn = ActionButton("Cancel")
+            self.action_btn.set_connected(False)
+            self.action_btn.setFixedHeight(40)
+            self.action_btn.clicked.connect(self._on_cancel)
         else:
             self.action_btn = ActionButton("Connect")
             self.action_btn.set_connected(False)
@@ -1049,6 +1083,10 @@ class ConnectionDialog(QDialog):
 
     def _on_disconnect(self):
         self.disconnect_clicked.emit()
+        self.accept()
+
+    def _on_cancel(self):
+        self.cancel_clicked.emit()
         self.accept()
 
     def update_status(self, connected: bool, text: str = ""):

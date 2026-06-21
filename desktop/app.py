@@ -159,12 +159,22 @@ class ConnectionManager(QObject):
 
     def disconnect(self):
         self._should_reconnect = False
-        if self.ws:
-            asyncio.run_coroutine_threadsafe(self._close_ws(), self.loop)
+        if self.ws and self.loop:
+            future = asyncio.run_coroutine_threadsafe(self._close_ws(), self.loop)
+            try:
+                future.result(timeout=2.0)
+            except Exception:
+                pass
         self._set_state(ConnectionState.DISCONNECTED)
 
     def cancel_connection(self):
         self._should_reconnect = False
+        if self.ws and self.loop:
+            future = asyncio.run_coroutine_threadsafe(self._close_ws(), self.loop)
+            try:
+                future.result(timeout=2.0)
+            except Exception:
+                pass
         self._set_state(ConnectionState.DISCONNECTED)
 
     def _run_loop(self):
@@ -177,6 +187,15 @@ class ConnectionManager(QObject):
         except Exception as e:
             self.error_occurred.emit(str(e))
             self._set_state(ConnectionState.ERROR)
+        finally:
+            if self.ws:
+                try:
+                    self.loop.run_until_complete(self._close_ws())
+                except Exception:
+                    pass
+            self.loop.close()
+            self.ws = None
+            self.loop = None
 
     async def _ws_worker(self):
         while self._should_reconnect:
@@ -806,6 +825,8 @@ class CommandsCenterWindow(QMainWindow):
             event.ignore()
         else:
             self.conn.disconnect()
+            if self.conn._thread and self.conn._thread.is_alive():
+                self.conn._thread.join(timeout=2.0)
             event.accept()
 
 class IconPicker(QDialog):
